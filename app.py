@@ -21,6 +21,97 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-Train if model.pkl is missing (e.g. first run on Streamlit Cloud)
+# ─────────────────────────────────────────────────────────────────────────────
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.pkl")
+_DATA_PATH  = os.path.join(os.path.dirname(__file__), "data", "indian_housing.csv")
+
+def _auto_train():
+    """Download data (if needed) and train the model."""
+    import warnings, requests, io
+    warnings.filterwarnings("ignore")
+    from sklearn.model_selection import train_test_split
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    # Download data if not present
+    if not os.path.exists(_DATA_PATH):
+        os.makedirs(os.path.dirname(_DATA_PATH), exist_ok=True)
+        cities = {
+            "Hyderabad": "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Hyderabad.csv",
+            "Mumbai":    "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Mumbai.csv",
+            "Chennai":   "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Chennai.csv",
+            "Delhi":     "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Delhi.csv",
+            "Bangalore": "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Bangalore.csv",
+            "Kolkata":   "https://raw.githubusercontent.com/anish2105/House-Price-Prediction/main/Kolkata.csv",
+        }
+        dfs = []
+        for city, url in cities.items():
+            r = requests.get(url, timeout=30)
+            df_c = pd.read_csv(io.StringIO(r.content.decode("utf-8")))
+            df_c["City"] = city
+            dfs.append(df_c)
+        pd.concat(dfs, ignore_index=True).to_csv(_DATA_PATH, index=False)
+
+    df = pd.read_csv(_DATA_PATH)
+    df.drop_duplicates(inplace=True)
+    df.dropna(subset=["Price", "Area"], inplace=True)
+    df = df[(df["Price"] >= df["Price"].quantile(0.01)) & (df["Price"] <= df["Price"].quantile(0.99))]
+    df = df[df["Area"] <= df["Area"].quantile(0.99)]
+
+    amenity_cols = [c for c in [
+        "MaintenanceStaff","Gymnasium","SwimmingPool","LandscapedGardens","JoggingTrack",
+        "RainWaterHarvesting","IndoorGames","ShoppingMall","Intercom","SportsFacility","ATM",
+        "ClubHouse","School","24X7Security","PowerBackup","CarParking","StaffQuarter","Cafeteria",
+        "MultipurposeRoom","Hospital","WashingMachine","Gasconnection","AC","Wifi",
+        "Children'splayarea","LiftAvailable","BED","VaastuCompliant","Microwave","GolfCourse",
+        "TV","DiningTable","Sofa","Wardrobe","Refrigerator"
+    ] if c in df.columns]
+
+    df["amenity_score"] = df[amenity_cols].sum(axis=1)
+    city_encoder = LabelEncoder()
+    df["City_encoded"] = city_encoder.fit_transform(df["City"])
+    top_locations = df["Location"].value_counts().nlargest(50).index.tolist()
+    df["Location_clean"] = df["Location"].apply(lambda x: x if x in top_locations else "Other")
+    loc_encoder = LabelEncoder()
+    df["Location_encoded"] = loc_encoder.fit_transform(df["Location_clean"])
+
+    FEATURES = ["Area","No. of Bedrooms","Resale","amenity_score","City_encoded","Location_encoded"] + amenity_cols
+    X = df[FEATURES]
+    y = np.log1p(df["Price"])
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    models = {
+        "Linear Regression": LinearRegression(),
+        "Random Forest":     RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingRegressor(n_estimators=200, learning_rate=0.1, max_depth=5, random_state=42),
+    }
+    results, trained = {}, {}
+    for name, m in models.items():
+        m.fit(X_train, y_train)
+        yp = np.expm1(m.predict(X_test))
+        yt = np.expm1(y_test)
+        results[name] = {"MAE": mean_absolute_error(yt, yp),
+                         "RMSE": np.sqrt(mean_squared_error(yt, yp)),
+                         "R2": r2_score(yt, yp)}
+        trained[name] = m
+
+    best_name = max(results, key=lambda k: results[k]["R2"])
+    with open(_MODEL_PATH, "wb") as f:
+        pickle.dump({"model": trained[best_name], "model_name": best_name, "features": FEATURES,
+                     "amenity_cols": amenity_cols, "city_encoder": city_encoder,
+                     "loc_encoder": loc_encoder, "top_locations": top_locations,
+                     "results": results}, f)
+
+if not os.path.exists(_MODEL_PATH):
+    with st.spinner("⚙️ First run: training model... (takes ~1-2 min)"):
+        _auto_train()
+    st.success("✅ Model trained! Reloading...")
+    st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Custom CSS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
